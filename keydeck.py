@@ -89,6 +89,13 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 GWL_EXSTYLE = -20
 WS_EX_NOACTIVATE = 0x08000000
+WS_EX_APPWINDOW = 0x00040000
+WS_EX_TOOLWINDOW = 0x00000080
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_FRAMECHANGED = 0x0020
 
 
 # --------------------------------------------------------------------------
@@ -248,7 +255,7 @@ def safe_name(name):
 
 
 def new_key_dict(name, x, y, w=1.0, h=1.0, label=None, label2="", color="", fg=""):
-    return {"key": name, "label": LABELS[name] if label is None else label,
+    return {"key": name, "label": LABELS.get(name, name) if label is None else label,
             "label2": label2, "x": x, "y": y, "w": w, "h": h, "color": color, "fg": fg}
 
 
@@ -959,6 +966,8 @@ class KeyDeck:
         self.apply_ui_scale()
 
         self.load_loadout(self.settings["loadout"])
+        self._last_caps_state = self.caps_on()
+        self.root.after(150, self.poll_caps_state)
         root.update_idletasks()
         self.place_window()
         self.apply_noactivate(True)
@@ -971,10 +980,30 @@ class KeyDeck:
         if not IS_WIN:
             return
         self.root.update_idletasks()
+        # Tk's winfo_id() is usually the client HWND.  Its parent is the
+        # actual top-level window, whose extended styles control taskbar
+        # behavior.
         hwnd = user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-        style = (style | WS_EX_NOACTIVATE) if on else (style & ~WS_EX_NOACTIVATE)
+
+        # Keep KeyDeck non-activating so clicking its virtual keys does not
+        # steal focus from the app receiving typed characters.  Explicitly
+        # mark it as an application window, however, so Windows creates a
+        # real taskbar button for the running window rather than only showing
+        # the pinned shortcut (which can launch a second copy when clicked).
+        style |= WS_EX_APPWINDOW
+        style &= ~WS_EX_TOOLWINDOW
+        if on:
+            style |= WS_EX_NOACTIVATE
+        else:
+            style &= ~WS_EX_NOACTIVATE
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+
+        # Tell Windows to recalculate the non-client/taskbar representation
+        # after changing extended styles.  NOACTIVATE prevents this refresh
+        # from taking focus away from the user's current app.
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, flags)
 
     def place_window(self):
         r = self.root
@@ -1180,7 +1209,7 @@ class KeyDeck:
         r1 = tk.Frame(p, bg=PANEL)
         r1.pack(fill="x", padx=4, pady=(8, 3))
         lbl(r1, "Sends")
-        cb = ttk.Combobox(r1, textvariable=self.v_key, values=list(CATALOG),
+        cb = ttk.Combobox(r1, textvariable=self.v_key, values=list(CATALOG) + ["Shortcut"],
                           width=11, state="readonly")
         cb.pack(side="left")
         cb.bind("<<ComboboxSelected>>", self.on_key_choice)
@@ -1209,8 +1238,10 @@ class KeyDeck:
         pbtn(r2, "Text color\u2026", lambda: self.pick_color("fg"))
         pbtn(r2, "Reset colors", self.reset_colors)
         pbtn(r2, "+ Add key", self.add_key)
+        pbtn(r2, "Program shortcut…", self.configure_shortcut)
         pbtn(r2, "Duplicate", self.duplicate_key)
         pbtn(r2, "Delete", self.delete_key)
+        pbtn(r2, "Clear all", self.clear_all_keys)
         pbtn(r2, "Save loadout", self.save_loadout)
         pbtn(r2, "Save as\u2026", self.save_loadout_as)
         tk.Label(r2, text="Drag keys to move \u2022 drag a corner to resize", bg=PANEL,
@@ -1242,12 +1273,16 @@ class KeyDeck:
         if not k:
             return
         old, new = k["key"], self.v_key.get()
+        if new == "Shortcut":
+            self.configure_shortcut()
+            return
         if new not in CATALOG:
             return
         if k["label"] in ("", LABELS.get(old)):
             k["label"] = LABELS[new]
             k["label2"] = ""
         k["key"] = new
+        k.pop("shortcut", None)
         self.load_props()
         self.refresh_key(k)
 
@@ -1309,6 +1344,80 @@ class KeyDeck:
         self.load_props()
         self.redraw()
 
+    def configure_shortcut(self):
+        """Turn the selected button into a key that sends a modifier shortcut."""
+        k = self.sel
+        if not k:
+            messagebox.showinfo("KeyDeck", "Select a key in Edit layout first.", parent=self.root)
+            return
+        current = k.get("shortcut", "Ctrl+Shift+Esc") if k.get("key") == "Shortcut" else "Ctrl+Shift+Esc"
+        raw = simpledialog.askstring(
+            "Program shortcut",
+            "Enter a shortcut using + between keys, e.g. Ctrl+Shift+Esc or Alt+F4.\n"
+            "Supported names include Ctrl, Shift, Alt, Win, letters, numbers, F1–F24, and other keyboard keys.\n"
+            "Note: Windows blocks software-generated Ctrl+Alt+Delete.",
+            initialvalue=current, parent=self.root)
+        if raw is None:
+            return
+        parsed, error = self.parse_shortcut(raw)
+        if error:
+            messagebox.showwarning("KeyDeck", error, parent=self.root)
+            return
+        k["key"] = "Shortcut"
+        k["shortcut"] = parsed
+        k["label"] = raw.strip()
+        k["label2"] = ""
+        self.load_props()
+        self.refresh_key(k)
+        self.fit_canvas()
+
+    def parse_shortcut(self, raw):
+        aliases = {
+            "ctrl": "LCtrl", "control": "LCtrl", "shift": "LShift",
+            "alt": "LAlt", "win": "LWin", "windows": "LWin",
+            "esc": "Esc", "escape": "Esc", "spacebar": "Space",
+            "return": "Enter", "del": "Delete", "ins": "Insert",
+            "pageup": "PgUp", "pagedown": "PgDn", "caps": "Caps Lock",
+        }
+        parts = [part.strip() for part in raw.split("+") if part.strip()]
+        if len(parts) < 2:
+            return None, "Enter at least two keys separated by +, such as Ctrl+Shift+Esc."
+        names = []
+        for part in parts:
+            name = aliases.get(part.lower(), part)
+            if name not in CATALOG:
+                # Case-insensitive match for ordinary catalog names.
+                name = next((n for n in CATALOG if n.lower() == part.lower()), name)
+            if name not in CATALOG:
+                return None, "I don't recognize the key '%s'." % part
+            names.append(name)
+        if len(set(names)) != len(names):
+            return None, "A shortcut cannot contain the same key more than once."
+        vks = [CATALOG[n][0] for n in names]
+        if 0x2E in vks and 0xA2 in vks and 0xA4 in vks:
+            return None, "Windows deliberately blocks software from generating Ctrl+Alt+Delete. Choose another shortcut, such as Ctrl+Shift+Esc for Task Manager."
+        return names, None
+
+    def clear_all_keys(self):
+        if not messagebox.askyesno("Clear keyboard", "Remove every key from this layout?\nYou can add keys again or save it as a blank loadout.", parent=self.root):
+            return
+        self.release_all(redraw=False)
+        self.keys = []
+        self.sel = None
+        self.load_props()
+        self.redraw()
+
+    def create_blank_layout(self):
+        self.release_all(redraw=False)
+        self.keys = []
+        self.sel = None
+        self.drag = None
+        self.loadout_name = ""
+        self.v_loadout.set("")
+        self.load_props()
+        self.redraw()
+        self.keep_on_screen()
+
     def delete_key(self):
         if not self.sel:
             return
@@ -1331,6 +1440,7 @@ class KeyDeck:
             m.add_radiobutton(label=name, variable=self.v_loadout, value=name,
                               command=lambda n=name: self.load_loadout(n))
         m.add_separator()
+        m.add_command(label="Blank layout (edit from scratch)", command=self.create_blank_layout)
         m.add_command(label="Save", command=self.save_loadout)
         m.add_command(label="Save as\u2026", command=self.save_loadout_as)
         m.add_command(label="Delete current loadout", command=self.delete_loadout)
@@ -1355,13 +1465,21 @@ class KeyDeck:
                     data = json.load(f)
                 keys = []
                 for raw in data.get("keys", []):
-                    if raw.get("key") not in CATALOG:
+                    if raw.get("key") not in CATALOG and raw.get("key") != "Shortcut":
                         continue
-                    k = new_key_dict(raw["key"], float(raw.get("x", 0)), float(raw.get("y", 0)),
+                    stored_key = raw["key"]
+                    if stored_key == "Shortcut" and not isinstance(raw.get("shortcut"), list):
+                        continue
+                    k = new_key_dict(stored_key, float(raw.get("x", 0)), float(raw.get("y", 0)),
                                      max(0.25, float(raw.get("w", 1))),
                                      max(0.25, float(raw.get("h", 1))),
-                                     raw.get("label", LABELS[raw["key"]]),
+                                     raw.get("label", LABELS.get(raw["key"], raw["key"])),
                                      raw.get("label2", ""), raw.get("color", ""), raw.get("fg", ""))
+                    if stored_key == "Shortcut":
+                        parsed, error = self.parse_shortcut("+".join(raw.get("shortcut", [])))
+                        if error:
+                            continue
+                        k["shortcut"] = parsed
                     keys.append(k)
             except Exception:
                 keys = None
@@ -1444,11 +1562,11 @@ class KeyDeck:
         return None
 
     def is_mod(self, k):
-        return CATALOG[k["key"]][0] in MOD_VKS
+        return k.get("key") in CATALOG and CATALOG[k["key"]][0] in MOD_VKS
 
     def shift_active(self):
         for k in self.keys:
-            if self.states.get(k["id"]) in ("oneshot", "hold") and CATALOG[k["key"]][0] in SHIFT_VKS:
+            if k.get("key") in CATALOG and self.states.get(k["id"]) in ("oneshot", "hold") and CATALOG[k["key"]][0] in SHIFT_VKS:
                 return True
         return False
 
@@ -1458,6 +1576,8 @@ class KeyDeck:
         if self.edit_mode:
             return base, fg
         st = self.states.get(k["id"])
+        if k.get("key") == "Caps Lock" and self.caps_on():
+            return ONESHOT_COLOR, "#1a1a1a"
         if st == "mom":
             return PRESS_COLOR, "#ffffff"
         if st == "oneshot":
@@ -1525,10 +1645,34 @@ class KeyDeck:
 
     # ---------------- typing ----------------
     def press_key(self, k):
-        self.sender.send(k["key"], True)
+        if k.get("key") == "Shortcut":
+            self.send_shortcut(k.get("shortcut", []))
+        else:
+            self.sender.send(k["key"], True)
 
     def release_key(self, k):
+        if k.get("key") == "Shortcut":
+            return
         self.sender.send(k["key"], False)
+
+    def send_shortcut(self, names):
+        """Tap a chord in modifier-first order, then release in reverse order."""
+        if not names:
+            return
+        mods = [n for n in names if CATALOG[n][0] in MOD_VKS]
+        regular = [n for n in names if n not in mods]
+        # Press modifiers first; tap each non-modifier while they are held.
+        pressed = []
+        try:
+            for name in mods:
+                self.sender.send(name, True)
+                pressed.append(name)
+            for name in regular:
+                self.sender.send(name, True)
+                self.sender.send(name, False)
+        finally:
+            for name in reversed(pressed):
+                self.sender.send(name, False)
 
     def set_state(self, k, st):
         was_shift = self.shift_active()
@@ -1767,6 +1911,19 @@ class KeyDeck:
     def caps_on(self):
         return bool(user32.GetKeyState(0x14) & 1) if IS_WIN else False
 
+    def poll_caps_state(self):
+        """Keep Caps Lock visibly lit even when toggled outside KeyDeck."""
+        try:
+            current = self.caps_on()
+            if current != self._last_caps_state:
+                self._last_caps_state = current
+                for k in self.keys:
+                    if k.get("key") == "Caps Lock":
+                        self.refresh_key(k)
+        finally:
+            if self.root.winfo_exists():
+                self.root.after(150, self.poll_caps_state)
+
     def game_like(self):
         """Held-down letter keys mean a game, not typing: don't track those."""
         if self.hold_mode:
@@ -1782,12 +1939,12 @@ class KeyDeck:
         for kid, st in self.states.items():
             if st in ("oneshot", "hold"):
                 k = self.key_by_id(kid)
-                if k and CATALOG[k["key"]][0] in CMD_VKS:
+                if k and k.get("key") in CATALOG and CATALOG[k["key"]][0] in CMD_VKS:
                     return True
         return False
 
     def predict_key(self, k):
-        if not self.settings["predict"] or self.edit_mode:
+        if not self.settings["predict"] or self.edit_mode or k.get("key") == "Shortcut":
             return
         now = time.monotonic()
         fw = self.fg_window()
@@ -1821,7 +1978,7 @@ class KeyDeck:
         capitalize = self.shift_active() and not self.pt.buffer
         for kid, st in list(self.states.items()):       # injected letters must not be shifted
             k = self.key_by_id(kid)
-            if k and st in ("oneshot", "hold") and CATALOG[k["key"]][0] in SHIFT_VKS:
+            if k and k.get("key") in CATALOG and st in ("oneshot", "hold") and CATALOG[k["key"]][0] in SHIFT_VKS:
                 self.release_latched(k)
         if capitalize:
             text = text[0].upper() + text[1:]
